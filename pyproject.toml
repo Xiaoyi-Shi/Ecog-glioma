@@ -8,6 +8,8 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "bids-validator-deno>=2.4.1",
+    "mne-bids>=0.18.0",
     "mne[full]>=1.12.1",
     "openpyxl>=3.1.5",
 ]

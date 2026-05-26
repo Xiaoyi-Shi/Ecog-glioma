@@ -79,6 +79,36 @@ Notes:
 - For the current ECoG workflow, electrode coordinates are still placeholders until manual localization is added later.
 - Validator status may be `passed_with_warnings` if the dataset has recommended-field warnings but no hard errors.
 
+## `bids_qc_report.py`
+
+Purpose:
+- Read the BIDS dataset under `datas/data_02_BIDS` in read-only mode.
+- Generate a simple patient-level QC overview as one HTML file under `results`.
+- Summarize bad-channel counts, bad-channel names, bad-segment positions, and PSD overviews.
+
+Important behavior:
+- The script does not modify anything inside `datas/data_02_BIDS`.
+- The only output is a dated HTML file such as `results/2026-05-25.html`.
+- PSD figures are embedded directly into the HTML report; no extra image folder is created.
+
+Basic usage:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\bids_qc_report.py
+```
+
+Common options:
+- `--bids-root`: input BIDS root, default `datas/data_02_BIDS`
+- `--output-dir`: report output directory, default `results`
+- `--fmin`: PSD lower frequency bound, default `1`
+- `--fmax`: PSD upper frequency bound, default `200`
+
+Example:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\bids_qc_report.py --fmin 1 --fmax 150
+```
+
 ## `eeg_prop_manual.py`
 
 Purpose:

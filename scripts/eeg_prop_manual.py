@@ -21,13 +21,13 @@ raw_file_path = list((data_path / "data_00_rawECoG").glob('*_929304_*.edf'))[0]
 raw = mne.io.read_raw_edf(raw_file_path, preload=True)
 
 #%%
-raw_file_path = Path(r"H:\lyz\Ecog-glioma\datas\data_00_rawECoG\20251020_936377_1.edf")
+raw_file_path = Path(r"H:\lyz\Ecog-glioma\datas\data_00_rawECoG\20251204_944023_1.edf")
 raw = mne.io.read_raw_edf(raw_file_path, preload=True)
-raw.filter(1, 150)
+#raw.filter(1, 1000)
 raw.plot(n_channels=len(raw.ch_names))
 
-time_start = 20
+time_start = 65
 raw_cut = raw.copy().crop(tmin=time_start, tmax=time_start+120)
-raw_cut.plot()
+raw_cut.plot(n_channels=len(raw.ch_names))
 
-raw_cut.save(data_path/ "data_01_ECoG_clean_1" / (raw_file_path.stem + ".fif") , overwrite=False)
+raw_cut.save(data_path/ "data_01_ECoG_clean_1" / (raw_file_path.stem + ".fif") , overwrite=True)

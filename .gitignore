@@ -9,6 +9,7 @@ wheels/
 *.egg-info
 datas
 results/
+docs/
 
 # Virtual environments
 .venv

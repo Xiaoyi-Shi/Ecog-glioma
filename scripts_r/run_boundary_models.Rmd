@@ -1,0 +1,197 @@
+---
+title: "Boundary Models Report"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+params:
+  run_dir: ""
+  script_dir: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(lme4)
+  library(lmerTest)
+  library(broom.mixed)
+  library(splines)
+  library(knitr)
+})
+
+run_dir <- normalizePath(params$run_dir, winslash = "/", mustWork = TRUE)
+model_dir <- file.path(run_dir, "07_stats_r")
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+
+joint_path <- file.path(run_dir, "06_model_tables", "model_joint_long.csv")
+if (!file.exists(joint_path)) {
+  stop("Missing model table: ", joint_path)
+}
+
+joint <- readr::read_csv(joint_path, show_col_types = FALSE)
+if (nrow(joint) == 0) {
+  readr::write_csv(tibble::tibble(message = "No model data available"), file.path(model_dir, "stats_summary.csv"))
+}
+
+joint <- joint %>%
+  mutate(
+    region = factor(region, levels = c(1, 2, 3, 4)),
+    patient = factor(patient),
+    interval_id = factor(interval_id)
+  )
+
+feature_candidates <- joint %>%
+  count(feature_name, sort = TRUE) %>%
+  filter(n >= 12) %>%
+  slice_head(n = 12) %>%
+  pull(feature_name)
+
+fit_region_model <- function(data) {
+  if (n_distinct(data$region, na.rm = TRUE) < 2) {
+    return(NULL)
+  }
+  tryCatch(
+    lmer(feature_z ~ region + is_boundary_interface + (1 | patient/interval_id), data = data),
+    error = function(e) NULL
+  )
+}
+
+fit_distance_model <- function(data) {
+  numeric_distance <- suppressWarnings(as.numeric(data$distance_mm))
+  data$distance_mm <- numeric_distance
+  data <- data[!is.na(data$distance_mm), , drop = FALSE]
+  if (nrow(data) < 8 || dplyr::n_distinct(data$patient) < 2) {
+    return(NULL)
+  }
+  tryCatch(
+    lmer(feature_z ~ splines::ns(distance_mm, df = 3) + (1 + distance_mm | patient), data = data),
+    error = function(e) NULL
+  )
+}
+
+compute_interval_morans_i <- function(data) {
+  data <- data %>%
+    mutate(interval_index = suppressWarnings(as.numeric(interval_index))) %>%
+    filter(!is.na(feature_z), !is.na(interval_index))
+  if (nrow(data) < 3) {
+    return(tibble::tibble(
+      morans_i = NA_real_,
+      expectation = NA_real_,
+      variance = NA_real_,
+      p.value = NA_real_,
+      note = "insufficient_intervals"
+    ))
+  }
+  data <- data %>% arrange(interval_index)
+  n <- nrow(data)
+  weights_matrix <- matrix(0, nrow = n, ncol = n)
+  for (i in seq_len(n)) {
+    current <- data$interval_index[i]
+    neighbors <- which(abs(data$interval_index - current) == 1)
+    neighbors <- neighbors[neighbors != i]
+    if (length(neighbors) > 0) {
+      weights_matrix[i, neighbors] <- 1 / length(neighbors)
+    }
+  }
+  total_weight <- sum(weights_matrix)
+  if (total_weight == 0) {
+    return(tibble::tibble(
+      morans_i = NA_real_,
+      expectation = NA_real_,
+      variance = NA_real_,
+      p.value = NA_real_,
+      note = "no_adjacent_neighbors"
+    ))
+  }
+  x <- data$feature_z
+  x_centered <- x - mean(x)
+  numerator <- n / total_weight * sum(weights_matrix * outer(x_centered, x_centered))
+  denominator <- sum(x_centered^2)
+  morans_i <- numerator / denominator
+  expectation <- -1 / (n - 1)
+  z_score <- (morans_i - expectation) / sqrt(1 / n)
+  p_value <- 2 * stats::pnorm(abs(z_score), lower.tail = FALSE)
+  tibble::tibble(
+    morans_i = as.numeric(morans_i),
+    expectation = as.numeric(expectation),
+    variance = as.numeric(1 / n),
+    p.value = as.numeric(p_value),
+    note = "adjacent_interval_index_graph_approx"
+  )
+}
+
+region_results <- purrr::map_dfr(feature_candidates, function(feature_name) {
+  data <- joint %>% filter(feature_name == !!feature_name, !is.na(feature_z))
+  model <- fit_region_model(data)
+  if (is.null(model)) {
+    return(tibble::tibble(feature_name = feature_name, term = NA_character_, estimate = NA_real_, std.error = NA_real_, statistic = NA_real_, p.value = NA_real_))
+  }
+  broom.mixed::tidy(model, effects = "fixed") %>% mutate(feature_name = feature_name)
+})
+
+distance_results <- purrr::map_dfr(feature_candidates, function(feature_name) {
+  data <- joint %>% filter(feature_name == !!feature_name, !is.na(feature_z))
+  model <- fit_distance_model(data)
+  if (is.null(model)) {
+    return(tibble::tibble(feature_name = feature_name, term = NA_character_, estimate = NA_real_, std.error = NA_real_, statistic = NA_real_, p.value = NA_real_))
+  }
+  broom.mixed::tidy(model, effects = "fixed") %>% mutate(feature_name = feature_name)
+})
+
+if ("p.value" %in% names(region_results)) {
+  region_results <- region_results %>%
+    mutate(p_fdr = p.adjust(p.value, method = "BH"))
+}
+if ("p.value" %in% names(distance_results)) {
+  distance_results <- distance_results %>%
+    mutate(p_fdr = p.adjust(p.value, method = "BH"))
+}
+
+moran_results <- joint %>%
+  filter(feature_name %in% feature_candidates, !is.na(feature_z)) %>%
+  group_by(feature_name, patient) %>%
+  group_modify(~ compute_interval_morans_i(.x)) %>%
+  ungroup()
+
+summary_table <- tibble::tibble(
+  run_dir = run_dir,
+  n_features_modeled = length(feature_candidates),
+  n_rows = nrow(joint),
+  n_patients = n_distinct(joint$patient)
+)
+
+readr::write_csv(region_results, file.path(model_dir, "region_model_results.csv"))
+readr::write_csv(distance_results, file.path(model_dir, "distance_spline_results.csv"))
+readr::write_csv(moran_results, file.path(model_dir, "morans_i_results.csv"))
+readr::write_csv(summary_table, file.path(model_dir, "stats_summary.csv"))
+```
+
+## Run Summary
+
+```{r}
+knitr::kable(summary_table)
+```
+
+## Region Model Results
+
+```{r}
+knitr::kable(head(region_results, 30))
+```
+
+## Distance Spline Results
+
+```{r}
+knitr::kable(head(distance_results, 30))
+```
+
+## Moran's I Diagnostics
+
+```{r}
+knitr::kable(head(moran_results, 30))
+```

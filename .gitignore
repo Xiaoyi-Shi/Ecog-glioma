@@ -1,8 +1,10 @@
 # Python-generated files
 __pycache__/
 .codex/
+.mne_local/
 
 *.py[oc]
+*.html
 build/
 dist/
 wheels/

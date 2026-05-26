@@ -1,0 +1,137 @@
+---
+title: "Boundary Figures Report"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+params:
+  run_dir: ""
+  script_dir: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(ggplot2)
+  library(tidyr)
+  library(stringr)
+  library(knitr)
+})
+
+run_dir <- normalizePath(params$run_dir, winslash = "/", mustWork = TRUE)
+fig_dir <- file.path(run_dir, "08_figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+script_dir <- params$script_dir
+if (!nzchar(script_dir)) {
+  script_dir <- dirname(normalizePath(knitr::current_input(), winslash = "/", mustWork = TRUE))
+}
+script_dir <- normalizePath(script_dir, winslash = "/", mustWork = TRUE)
+source(file.path(script_dir, "theme_khaki.R"))
+
+joint_path <- file.path(run_dir, "06_model_tables", "model_joint_long.csv")
+if (!file.exists(joint_path)) {
+  stop("Missing model table: ", joint_path)
+}
+
+joint <- readr::read_csv(joint_path, show_col_types = FALSE)
+joint <- joint %>%
+  mutate(region = factor(region, levels = c(1, 2, 3, 4)))
+
+save_plot <- function(plot_obj, filename, width = 10, height = 6) {
+  ggplot2::ggsave(
+    filename = file.path(fig_dir, filename),
+    plot = plot_obj,
+    width = width,
+    height = height,
+    dpi = 300,
+    bg = khaki_palette$plot_bg
+  )
+}
+
+distance_plot_data <- joint %>%
+  filter(!is.na(distance_mm), feature_family %in% c("static", "dynamic", "fragility", "hfo")) %>%
+  count(patient, interval_id, region, distance_mm)
+
+if (nrow(distance_plot_data) > 0) {
+  p_distance <- ggplot(distance_plot_data, aes(x = distance_mm, fill = region)) +
+    geom_histogram(binwidth = 0.5, color = khaki_palette$border, alpha = 0.85) +
+    scale_fill_manual(values = c("#6E7F4D", "#A65E2E", "#7B3F3F", "#8B6F47")) +
+    labs(
+      title = "Figure 2. Interval Distance Distribution",
+      x = "Distance to tumor boundary (mm)",
+      y = "Interval count",
+      fill = "Region"
+    ) +
+    theme_boundary_khaki()
+  save_plot(p_distance, "Figure2_distance_distribution.png")
+} else {
+  p_distance <- NULL
+}
+
+top_features <- joint %>%
+  count(feature_name, sort = TRUE) %>%
+  slice_head(n = 6) %>%
+  pull(feature_name)
+
+feature_box <- joint %>%
+  filter(feature_name %in% top_features, !is.na(feature_z))
+
+if (nrow(feature_box) > 0) {
+  p_features <- ggplot(feature_box, aes(x = region, y = feature_z, fill = region)) +
+    geom_boxplot(alpha = 0.85, outlier.size = 0.6) +
+    facet_wrap(~ feature_name, scales = "free_y") +
+    scale_fill_manual(values = c("#6E7F4D", "#A65E2E", "#7B3F3F", "#8B6F47")) +
+    labs(
+      title = "Figure 3-8 Preview. Region-Level Feature Distributions",
+      x = "Region",
+      y = "Patient-normalized feature value"
+    ) +
+    theme_boundary_khaki()
+  save_plot(p_features, "Figure3_8_feature_distributions.png", width = 12, height = 8)
+} else {
+  p_features <- NULL
+}
+
+hfo_scatter_data <- joint %>%
+  filter(str_detect(feature_name, "rate_per_min"), !is.na(feature_z), !is.na(distance_mm))
+
+if (nrow(hfo_scatter_data) > 0) {
+  p_hfo <- ggplot(hfo_scatter_data, aes(x = distance_mm, y = feature_z, color = region)) +
+    geom_point(alpha = 0.75, size = 1.8) +
+    geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+    scale_color_manual(values = c("#6E7F4D", "#A65E2E", "#7B3F3F", "#8B6F47")) +
+    facet_wrap(~ feature_name, scales = "free_y") +
+    labs(
+      title = "Figure 6/10 Preview. HFO Rate vs Boundary Distance",
+      x = "Distance to tumor boundary (mm)",
+      y = "Patient-normalized HFO feature"
+    ) +
+    theme_boundary_khaki()
+  save_plot(p_hfo, "Figure6_10_hfo_distance.png", width = 12, height = 8)
+} else {
+  p_hfo <- NULL
+}
+```
+
+## Generated Figures
+
+### Figure 2
+
+```{r}
+if (!is.null(p_distance)) print(p_distance)
+```
+
+### Figure 3-8 Preview
+
+```{r}
+if (!is.null(p_features)) print(p_features)
+```
+
+### Figure 6/10 Preview
+
+```{r}
+if (!is.null(p_hfo)) print(p_hfo)
+```

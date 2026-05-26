@@ -14,6 +14,39 @@ Recommended interpreter:
 
 Using the project virtual environment matters because the system `python` may not have `mne`, `mne-bids`, or `openpyxl` installed.
 
+R scripts require a working `Rscript` on `PATH`.
+
+Current reporting scripts expect these R packages:
+- `dplyr`
+- `readr`
+- `tidyr`
+- `stringr`
+- `purrr`
+- `ggplot2`
+- `lme4`
+- `lmerTest`
+- `broom.mixed`
+- `splines`
+
+All new analysis outputs for the boundary-gradient workflow are written into
+timestamped subdirectories under `results`, for example:
+
+```text
+results/20260526_154027/
+```
+
+Each run directory contains:
+- `00_manifest`
+- `01_qc`
+- `02_static_network`
+- `03_hfo`
+- `04_controllability`
+- `05_fragility`
+- `06_model_tables`
+- `07_stats_r`
+- `08_figures`
+- `logs`
+
 ## `fif_to_bids.py`
 
 Purpose:
@@ -108,6 +141,161 @@ Example:
 ```powershell
 .\.venv\Scripts\python.exe scripts\bids_qc_report.py --fmin 1 --fmax 150
 ```
+
+## Boundary Analysis Pipeline
+
+The Version 2 research workflow from `docs/科研路径提纲版本2.md` is implemented
+as a read-only BIDS analysis pipeline.
+
+Method summary:
+- Read input from `datas/data_02_BIDS`
+- Parse interval labels from `datas/ele_pos.xlsx`
+- Convert monopolar contacts into adjacent bipolar intervals
+- Compute static network, HFO, controllability, and fragility features
+- Export model-ready tables
+- Run R statistics and khaki-themed figure generation from an existing timestamped result directory
+
+The pipeline does not modify `datas/data_02_BIDS`.
+
+### `build_label_manifest.py`
+
+Purpose:
+- Build the interval label manifest and QC tables
+- Create or reuse a timestamped run directory under `results`
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_label_manifest.py
+```
+
+### `run_static_network.py`
+
+Purpose:
+- Compute dwPLI connectivity per band
+- Export node-level and multilayer static-network summaries
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_static_network.py --run-dir results\20260526_154027
+```
+
+### `run_hfo.py`
+
+Purpose:
+- Detect ripple and fast-ripple events
+- Export event-level and interval-level HFO summaries
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_hfo.py --run-dir results\20260526_154027
+```
+
+### `run_controllability.py`
+
+Purpose:
+- Estimate sliding-window state matrices
+- Export average and modal controllability summaries
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_controllability.py --run-dir results\20260526_154027
+```
+
+### `run_fragility.py`
+
+Purpose:
+- Compute neural fragility from saved state matrices
+- Export window-level and interval-level fragility summaries
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fragility.py --run-dir results\20260526_154027
+```
+
+### `export_model_tables.py`
+
+Purpose:
+- Merge Python stage outputs into R-ready long tables
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\export_model_tables.py --run-dir results\20260526_154027
+```
+
+### `run_pipeline_v2.py`
+
+Purpose:
+- Run the Python stages of the Version 2 boundary-gradient pipeline
+- Create or reuse a timestamped run directory under `results`
+- Generate all Python-side outputs up to `06_model_tables`
+
+Recommended first step:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_pipeline_v2.py
+```
+
+Optional combined run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_pipeline_v2.py --with-r
+```
+
+Main outputs from a completed Python run:
+- `00_manifest/label_manifest.csv`
+- `01_qc/patient_qc_summary.csv`
+- `02_static_network/node_features_static.csv`
+- `03_hfo/hfo_channel_summary.csv`
+- `04_controllability/channel_level_ac_mc_summary.csv`
+- `05_fragility/channel_level_fragility_summary.csv`
+- `06_model_tables/model_joint_long.csv`
+
+Console output includes the generated run directory, for example:
+
+```text
+Python pipeline complete: F:\uv_env\Ecog-glioma\results\20260526_161122
+```
+
+### `run_r_reporting.py`
+
+Purpose:
+- Run R statistical modeling and figure generation for an existing timestamped run directory
+- Reuse the Python outputs already generated in `00_manifest` to `06_model_tables`
+- Avoid re-running the full Python feature extraction when only statistics or plots need refresh
+
+Run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_r_reporting.py --run-dir results\20260526_161122
+```
+
+Outputs written by the R stage:
+- `07_stats_r/*.csv`
+- `07_stats_r/run_boundary_models.html`
+- `08_figures/*.png`
+- `08_figures/run_boundary_figures.html`
+
+R reporting implementation notes:
+- Statistical modeling is rendered from `scripts_r/run_boundary_models.Rmd`
+- Figure reporting is rendered from `scripts_r/run_boundary_figures.Rmd`
+- Both reports are emitted as HTML into the same run-specific output directories as before
+
+Direct R entry point:
+
+```powershell
+Rscript scripts_r\run_boundary_reporting.R --run-dir results\20260526_161122
+```
+
+Recommended execution order:
+1. Run `scripts\run_pipeline_v2.py` once to generate a new timestamped results directory.
+2. Keep the printed `results\<timestamp>` path.
+3. Run `Rscript scripts_r\run_boundary_reporting.R --run-dir results\<timestamp>` whenever you need to regenerate statistics or figures for that same run.
 
 ## `eeg_prop_manual.py`
 

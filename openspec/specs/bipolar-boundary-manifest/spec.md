@@ -1,7 +1,12 @@
-## ADDED Requirements
+# bipolar-boundary-manifest Specification
+
+## Purpose
+Define how boundary labels, adjacent bipolar analysis units, and downstream QC inclusion tables are constructed for the boundary-analysis workflow.
+
+## Requirements
 
 ### Requirement: Parse interval labels into a standardized manifest
-The system SHALL read `datas/ele_pos.xlsx` and export an interval-level manifest for `sesion = before` that preserves the raw label, resolves `patient_id` and `Sub-ID`, and derives `interval_id`, `distance_mm`, `region`, `is_boundary_interface`, and parse-status fields for every adjacent-contact interval column.
+The system SHALL read `datas/ele_pos.xlsx` and export an interval-level manifest for `session = before` that preserves the raw label, resolves `patient_id` and `Sub-ID`, and derives `interval_id`, `distance_mm`, `region`, `is_boundary_interface`, and parse-status fields for every adjacent-contact interval column.
 
 #### Scenario: Tumor-internal label is parsed
 - **WHEN** an interval cell contains an `a*` label
@@ -13,7 +18,7 @@ The system SHALL read `datas/ele_pos.xlsx` and export an interval-level manifest
 
 #### Scenario: Non-zero tumor-external label is parsed
 - **WHEN** an interval cell contains a `b*[distance]` label with a positive numeric distance
-- **THEN** the manifest records that interval as valid and assigns `region = 2` for `0 < distance <= 1`, `region = 3` for `1 < distance <= 3`, or `region = 4` for `distance > 3`
+- **THEN** the manifest records that interval as valid and assigns `region = 2` for `0 <= distance < 1.5` or `region = 3` for `distance >= 1.5`
 
 #### Scenario: Invalid or unsupported label is encountered
 - **WHEN** an interval cell is blank, marked `用不了`, or cannot be parsed into `a*` or `b*[distance]`

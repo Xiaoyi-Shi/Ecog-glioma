@@ -12,6 +12,43 @@ def _load_csv(path: Path, dtype: dict[str, str] | None = None) -> pd.DataFrame:
     return read_dataframe(path, dtype=dtype)
 
 
+def _merge_label_columns(
+    frame: pd.DataFrame,
+    label_qc: pd.DataFrame,
+    label_cols: list[str],
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    merged = frame.merge(
+        label_qc[label_cols],
+        left_on=["patient", "session", "interval_id"],
+        right_on=["subject", "session", "interval_id"],
+        how="left",
+    )
+    return merged.drop(columns=["subject"])
+
+
+def _finalize_banded_metric_long(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    result = frame.copy()
+    result["metric_family"] = result["metric_family"].astype(str)
+    result["feature_name"] = result["band"] + "_" + result["metric_family"]
+    result = add_patient_zscore(
+        result,
+        patient_col="patient",
+        feature_col="feature_name",
+        output_col="feature_z_within_band",
+    )
+    result = add_patient_zscore(
+        result,
+        patient_col="patient",
+        feature_col="metric_family",
+        output_col="feature_z",
+    )
+    return result
+
+
 def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
     manifest = _load_csv(
         context.stage_path("manifest") / "label_manifest.csv",
@@ -23,6 +60,10 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
     )
     static_nodes = _load_csv(
         context.stage_path("static_network") / "node_features_static.csv",
+        dtype={"subject": str, "session": str, "run": str, "band": str, "interval_id": str, "metric": str},
+    )
+    directed_nodes = _load_csv(
+        context.stage_path("static_network") / "directed_source_sink_features.csv",
         dtype={"subject": str, "session": str, "run": str, "band": str, "interval_id": str, "metric": str},
     )
     multilayer_nodes = _load_csv(
@@ -68,9 +109,10 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
         "patient_sensitivity_included",
     ]
 
+    static_feature_sources = [frame for frame in [static_nodes, directed_nodes] if not frame.empty]
     static_long = pd.DataFrame()
-    if not static_nodes.empty:
-        static_long = static_nodes.rename(
+    if static_feature_sources:
+        static_long = pd.concat(static_feature_sources, ignore_index=True, sort=False).rename(
             columns={
                 "subject": "patient",
                 "metric": "feature_name",
@@ -79,13 +121,7 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
         )
         static_long["feature_family"] = "static"
         static_long["feature_name"] = static_long["band"] + "_" + static_long["feature_name"]
-        static_long = static_long.merge(
-            label_qc[label_cols],
-            left_on=["patient", "session", "interval_id"],
-            right_on=["subject", "session", "interval_id"],
-            how="left",
-        )
-        static_long = static_long.drop(columns=["subject"])
+        static_long = _merge_label_columns(static_long, label_qc, label_cols)
         static_long = add_patient_zscore(static_long, patient_col="patient")
 
     if not multilayer_nodes.empty:
@@ -100,13 +136,7 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
         multilayer_long["feature_name"] = (
             multilayer_long["feature_name"] + "_omega_" + multilayer_long["omega"].astype(str)
         )
-        multilayer_long = multilayer_long.merge(
-            label_qc[label_cols],
-            left_on=["patient", "session", "interval_id"],
-            right_on=["subject", "session", "interval_id"],
-            how="left",
-        )
-        multilayer_long = multilayer_long.drop(columns=["subject"])
+        multilayer_long = _merge_label_columns(multilayer_long, label_qc, label_cols)
         multilayer_long = add_patient_zscore(multilayer_long, patient_col="patient")
         static_long = pd.concat([static_long, multilayer_long], ignore_index=True, sort=False)
 
@@ -120,13 +150,8 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
         ).rename(columns={"subject": "patient"})
         hfo_long["feature_family"] = "hfo"
         hfo_long["feature_name"] = hfo_long["hfo_type"] + "_" + hfo_long["metric"]
-        hfo_long = hfo_long.merge(
-            label_qc[label_cols],
-            left_on=["patient", "session", "interval_id"],
-            right_on=["subject", "session", "interval_id"],
-            how="left",
-        )
-        hfo_long = hfo_long.drop(columns=["subject", "metric"])
+        hfo_long = _merge_label_columns(hfo_long, label_qc, label_cols)
+        hfo_long = hfo_long.drop(columns=["metric"])
         hfo_long = add_patient_zscore(hfo_long, patient_col="patient")
 
     dynamic_long = pd.DataFrame()
@@ -150,13 +175,8 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
         ).rename(columns={"subject": "patient"})
         ac_mc_long["feature_family"] = "dynamic"
         ac_mc_long["feature_name"] = ac_mc_long["band"] + "_" + ac_mc_long["metric"]
-        ac_mc_long = ac_mc_long.merge(
-            label_qc[label_cols],
-            left_on=["patient", "session", "interval_id"],
-            right_on=["subject", "session", "interval_id"],
-            how="left",
-        )
-        dynamic_long = ac_mc_long.drop(columns=["subject", "metric"])
+        ac_mc_long = _merge_label_columns(ac_mc_long, label_qc, label_cols)
+        dynamic_long = ac_mc_long.drop(columns=["metric"])
         dynamic_long = add_patient_zscore(dynamic_long, patient_col="patient")
 
     fragility_long = pd.DataFrame()
@@ -175,14 +195,67 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
         ).rename(columns={"subject": "patient"})
         fragility_long["feature_family"] = "fragility"
         fragility_long["feature_name"] = fragility_long["band"] + "_" + fragility_long["metric"]
-        fragility_long = fragility_long.merge(
-            label_qc[label_cols],
-            left_on=["patient", "session", "interval_id"],
-            right_on=["subject", "session", "interval_id"],
-            how="left",
-        )
-        fragility_long = fragility_long.drop(columns=["subject", "metric"])
+        fragility_long = _merge_label_columns(fragility_long, label_qc, label_cols)
+        fragility_long = fragility_long.drop(columns=["metric"])
         fragility_long = add_patient_zscore(fragility_long, patient_col="patient")
+
+    band_metric_long_frames: list[pd.DataFrame] = []
+    if static_feature_sources:
+        band_metric_static = pd.concat(static_feature_sources, ignore_index=True, sort=False).rename(
+            columns={
+                "subject": "patient",
+                "metric": "metric_family",
+                "value": "feature_value",
+            }
+        )
+        band_metric_static["feature_family"] = "static"
+        band_metric_static = _merge_label_columns(band_metric_static, label_qc, label_cols)
+        band_metric_long_frames.append(_finalize_banded_metric_long(band_metric_static))
+
+    if not controllability.empty:
+        band_metric_dynamic = controllability.melt(
+            id_vars=["subject", "session", "run", "band", "interval_id"],
+            value_vars=[
+                "average_controllability_mean",
+                "average_controllability_std",
+                "average_controllability_p75",
+                "average_controllability_p90",
+                "average_controllability_high_ratio",
+                "modal_controllability_mean",
+                "modal_controllability_std",
+                "modal_controllability_p75",
+                "modal_controllability_p90",
+                "modal_controllability_high_ratio",
+            ],
+            var_name="metric_family",
+            value_name="feature_value",
+        ).rename(columns={"subject": "patient"})
+        band_metric_dynamic["feature_family"] = "dynamic"
+        band_metric_dynamic = _merge_label_columns(band_metric_dynamic, label_qc, label_cols)
+        band_metric_long_frames.append(_finalize_banded_metric_long(band_metric_dynamic))
+
+    if not fragility.empty:
+        band_metric_fragility = fragility.melt(
+            id_vars=["subject", "session", "run", "band", "interval_id"],
+            value_vars=[
+                "fragility_mean",
+                "fragility_std",
+                "fragility_p75",
+                "fragility_p90",
+                "fragility_high_ratio",
+            ],
+            var_name="metric_family",
+            value_name="feature_value",
+        ).rename(columns={"subject": "patient"})
+        band_metric_fragility["feature_family"] = "fragility"
+        band_metric_fragility = _merge_label_columns(band_metric_fragility, label_qc, label_cols)
+        band_metric_long_frames.append(_finalize_banded_metric_long(band_metric_fragility))
+
+    band_metric_long = (
+        pd.concat(band_metric_long_frames, ignore_index=True, sort=False)
+        if band_metric_long_frames
+        else pd.DataFrame()
+    )
 
     joint_long = pd.concat(
         [frame for frame in [static_long, hfo_long, dynamic_long, fragility_long] if not frame.empty],
@@ -196,14 +269,13 @@ def build_model_tables(context: RunContext) -> dict[str, pd.DataFrame]:
     if not multilayer_patient.empty:
         patient_summary = multilayer_patient.copy()
 
+    dynamic_frames = [frame for frame in [dynamic_long, fragility_long] if not frame.empty]
+
     return {
+        "model_band_metric_long": band_metric_long,
         "model_static_long": static_long,
         "model_hfo_long": hfo_long,
-        "model_dynamic_long": pd.concat(
-            [frame for frame in [dynamic_long, fragility_long] if not frame.empty],
-            ignore_index=True,
-            sort=False,
-        ),
+        "model_dynamic_long": pd.concat(dynamic_frames, ignore_index=True, sort=False) if dynamic_frames else pd.DataFrame(),
         "model_joint_long": joint_long,
         "model_patient_summary": patient_summary,
     }

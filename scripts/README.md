@@ -45,6 +45,8 @@ Each run directory contains:
 - `06_model_tables`
 - `07_stats_r`
 - `08_figures`
+- `09_dynamic_audit`
+- `10_coupling_robustness`
 - `logs`
 
 ## `fif_to_bids.py`
@@ -254,6 +256,7 @@ Main outputs from a completed Python run:
 - `03_hfo/hfo_channel_summary.csv`
 - `04_controllability/channel_level_ac_mc_summary.csv`
 - `05_fragility/channel_level_fragility_summary.csv`
+- `06_model_tables/model_band_metric_long.csv`
 - `06_model_tables/model_joint_long.csv`
 
 Console output includes the generated run directory, for example:
@@ -276,15 +279,41 @@ Run:
 ```
 
 Outputs written by the R stage:
-- `07_stats_r/*.csv`
-- `07_stats_r/run_boundary_models.html`
-- `08_figures/*.png`
-- `08_figures/run_boundary_figures.html`
+- `07_stats_r/<cohort>/*.csv`
+- `07_stats_r/<cohort>/run_boundary_models.html`
+- `08_figures/<cohort>/*.png`
+- `08_figures/<cohort>/run_boundary_figures.html`
+- `09_dynamic_audit/*.csv`
+- `09_dynamic_audit/dynamic_audit_summary.md`
+- `10_coupling_robustness/*.csv`
+- `10_coupling_robustness/coupling_robustness_summary.md`
+
+Where `<cohort>` is one of `main`, `sensitivity`, or `full_modelable`.
 
 R reporting implementation notes:
 - Statistical modeling is rendered from `scripts_r/run_boundary_models.Rmd`
 - Figure reporting is rendered from `scripts_r/run_boundary_figures.Rmd`
-- Both reports are emitted as HTML into the same run-specific output directories as before
+- The Python entry point now renders `main`, `sensitivity`, and `full_modelable` cohorts into separate subdirectories under `07_stats_r/` and `08_figures/`
+- `main` is the primary analysis cohort; `sensitivity` and `full_modelable` outputs are exploratory and labeled as such in metadata and report content
+- The Python entry point also writes a dedicated `09_dynamic_audit/` stage with cohort manifests, AC-vs-fragility audit tables, and the structural baseline summary
+- The Python entry point also writes a dedicated `10_coupling_robustness/` stage with decomposition summaries, null-comparison summaries, threshold scans, a stability matrix, and machine-readable robustness labels
+- Figure generation now writes the current paper-facing figure set:
+  - `Figure1_cohort_definition_and_coverage.png`
+  - `Figure2_fragility_region_contrasts.png`
+  - `Figure3_ac_nf_inverse_coupling.png`
+  - `Figure4_cross_cohort_robustness_heatmap.png`
+  - `Figure5_inclusion_threshold_stability_scan.png`
+  - `SupplementaryFigure1_region2_ac_vs_fragility.png`
+  - `SupplementaryFigure2_hfo_network_consistency.png`
+- Additional statistical exports include cohort summaries, workflow-status tables, HFO-network consistency summaries, and region-by-band models
+- AC-vs-fragility coupling outputs now live under `09_dynamic_audit/` instead of being mixed into the primary inferential result directory
+- The figure narrative is intentionally conservative: AC-NF inverse coupling is treated as the most stable result, regional fragility contrasts are secondary, and HFO / continuous-distance outputs are supplementary rather than central
+- Robustness-supported versus exploratory AC/NF conclusions are surfaced back into `07_stats_r/<cohort>/coupling_robustness_summary.csv`, `08_figures/<cohort>/Figure4_cross_cohort_robustness_heatmap.png`, and `08_figures/<cohort>/Figure5_inclusion_threshold_stability_scan.png`
+
+Cohort semantics:
+- `main`: patients meeting the main threshold (`>= 16` usable intervals); primary reporting cohort
+- `sensitivity`: patients meeting the sensitivity threshold (`>= 12` usable intervals); exploratory robustness cohort
+- `full_modelable`: all model-table rows that reach the reporting layer; exploratory reference cohort
 
 Direct R entry point:
 
@@ -292,10 +321,23 @@ Direct R entry point:
 Rscript scripts_r\run_boundary_reporting.R --run-dir results\20260526_161122
 ```
 
+Direct R entry-point note:
+- It re-renders the cohort-partitioned `07_stats_r/` and `08_figures/` outputs.
+- The full `09_dynamic_audit/` and `10_coupling_robustness/` stages are produced by `scripts\run_r_reporting.py`, so prefer the Python entry point when regenerating the complete reporting package.
+
 Recommended execution order:
 1. Run `scripts\run_pipeline_v2.py` once to generate a new timestamped results directory.
 2. Keep the printed `results\<timestamp>` path.
-3. Run `Rscript scripts_r\run_boundary_reporting.R --run-dir results\<timestamp>` whenever you need to regenerate statistics or figures for that same run.
+3. Run `.\.venv\Scripts\python.exe scripts\run_r_reporting.py --run-dir results\<timestamp>` whenever you need to regenerate the full cohort-partitioned reporting package, including `09_dynamic_audit` and `10_coupling_robustness`.
+4. Use `Rscript scripts_r\run_boundary_reporting.R --run-dir results\<timestamp>` only if you specifically want to rerender the cohort-partitioned R reports without rebuilding the Python audit/robustness stages.
+
+Robustness-stage outputs:
+- `decomposition_summary.csv`: pooled, between-patient, within-patient, within-region, and within-band AC/NF coupling summaries with insufficient-data status fields
+- `null_comparison_summary.csv`: observed coupling matched to structural-baseline and permutation null summaries
+- `inclusion_threshold_scan.csv`: headline findings scanned across predefined patient-inclusion thresholds
+- `distance_threshold_scan.csv`: boundary-versus-remote headline findings scanned across predefined distance thresholds
+- `stability_matrix.csv`: compact summary of direction reversals, significance losses, and insufficient cases
+- `robustness_summary.csv`: machine-readable headline labels such as `supported`, `exploratory`, `artifact_risk`, `threshold_sensitive`, and `insufficient`
 
 ## `eeg_prop_manual.py`
 

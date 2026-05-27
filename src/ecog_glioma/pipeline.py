@@ -9,6 +9,7 @@ import pandas as pd
 
 from .bids_io import index_bids_recordings, load_channels_table, read_raw_recording
 from .bipolar import clean_duration_seconds, derive_adjacent_bipolar
+from .coupling_robustness import run_coupling_robustness_stage
 from .config import (
     DEFAULT_BIDS_ROOT,
     DEFAULT_DYNAMIC_STEP_SECONDS,
@@ -32,12 +33,15 @@ from .dynamic import (
     save_state_matrices,
     summarize_window_metrics,
 )
+from .dynamic_audit import run_dynamic_audit_stage
 from .export_tables import write_model_tables
 from .hfo import run_hfo_detection
 from .labels import build_label_manifest
 from .paths import as_repo_path, repo_root
+from .reporting import REPORTING_COHORTS
 from .run_context import RunContext
 from .static_network import (
+    compute_band_source_sink,
     compute_band_connectivity,
     compute_multilayer_features,
     compute_node_metrics,
@@ -193,7 +197,7 @@ def run_static_network_stage(
     bids_root: Path = DEFAULT_BIDS_ROOT,
     epoch_seconds: float = DEFAULT_STATIC_EPOCH_SECONDS,
     omegas: tuple[float, ...] = DEFAULT_OMEGAS,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     _, interval_qc, _ = _load_manifest_qc_from_context(context)
     recordings = index_bids_recordings(bids_root)
     recordings = [entry for entry in recordings if entry.session == DEFAULT_SESSION_FILTER]
@@ -201,6 +205,7 @@ def run_static_network_stage(
     matrix_dir.mkdir(parents=True, exist_ok=True)
 
     node_rows: list[dict[str, Any]] = []
+    directed_rows: list[dict[str, Any]] = []
     multilayer_node_rows: list[dict[str, Any]] = []
     multilayer_patient_rows: list[dict[str, Any]] = []
     stage_summary: list[dict[str, Any]] = []
@@ -245,11 +250,36 @@ def run_static_network_stage(
                             "value": float(value),
                         }
                     )
+            source_sink, directed_matrix, directed_metadata = compute_band_source_sink(
+                recording=bipolar,
+                interval_ids=usable_interval_ids,
+                band=band,
+                epoch_seconds=epoch_seconds,
+            )
+            save_matrix(
+                directed_matrix,
+                usable_interval_ids,
+                matrix_dir / f"sub-{entry.subject}_{band.name}_source_sink_directed.csv",
+            )
+            for interval_id, value in zip(usable_interval_ids, source_sink, strict=False):
+                directed_rows.append(
+                    {
+                        "subject": entry.subject,
+                        "session": entry.session,
+                        "run": entry.run,
+                        "band": band.name,
+                        "interval_id": interval_id,
+                        "metric": "source_sink_index",
+                        "value": float(value),
+                    }
+                )
             stage_summary.append(
                 {
                     "subject": entry.subject,
                     "band": band.name,
                     **metadata,
+                    "directed_method": directed_metadata["method"],
+                    "directed_n_epochs": directed_metadata["n_epochs"],
                 }
             )
 
@@ -270,9 +300,11 @@ def run_static_network_stage(
             multilayer_patient_rows.extend(multilayer_patient.to_dict(orient="records"))
 
     node_features = pd.DataFrame(node_rows)
+    directed_features = pd.DataFrame(directed_rows)
     multilayer_node_features = pd.DataFrame(multilayer_node_rows)
     multilayer_patient_features = pd.DataFrame(multilayer_patient_rows)
     write_dataframe(node_features, context.stage_path("static_network") / "node_features_static.csv", index=False)
+    write_dataframe(directed_features, context.stage_path("static_network") / "directed_source_sink_features.csv", index=False)
     write_dataframe(multilayer_node_features, context.stage_path("static_network") / "multilayer_node_features.csv", index=False)
     write_dataframe(multilayer_patient_features, context.stage_path("static_network") / "multilayer_patient_features.csv", index=False)
     write_dataframe(pd.DataFrame(stage_summary), context.stage_path("static_network") / "connectivity_stage_summary.csv", index=False)
@@ -282,11 +314,12 @@ def run_static_network_stage(
             "epoch_seconds": epoch_seconds,
             "omegas": list(omegas),
             "node_rows": int(len(node_features)),
+            "directed_rows": int(len(directed_features)),
             "multilayer_node_rows": int(len(multilayer_node_features)),
             "multilayer_patient_rows": int(len(multilayer_patient_features)),
         },
     )
-    return node_features, multilayer_node_features, multilayer_patient_features
+    return node_features, directed_features, multilayer_node_features, multilayer_patient_features
 
 
 def run_hfo_stage(
@@ -495,51 +528,128 @@ def export_model_tables_stage(context: RunContext) -> dict[str, Path]:
     return outputs
 
 
+def _render_rmarkdown_report(
+    *,
+    context: RunContext,
+    script: Path,
+    output_dir: Path,
+    output_file: str,
+    cohort_name: str,
+    analysis_role: str,
+    coupling_robustness_dir: Path,
+) -> None:
+    render_expression = (
+        "rmarkdown::render("
+        f"input='{script.as_posix()}', "
+        f"output_file='{output_file}', "
+        f"output_dir='{output_dir.as_posix()}', "
+        f"params=list(run_dir='{context.run_root.as_posix()}', "
+        f"script_dir='{script.parent.as_posix()}', "
+        f"report_dir='{output_dir.as_posix()}', "
+        f"dynamic_audit_dir='{context.stage_path('dynamic_audit').as_posix()}', "
+        f"coupling_robustness_dir='{coupling_robustness_dir.as_posix()}', "
+        f"cohort_name='{cohort_name}', "
+        f"analysis_role='{analysis_role}'), "
+        "envir=new.env(parent=globalenv()))"
+    )
+    completed = subprocess.run(
+        ["Rscript", "-e", render_expression],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    log_path = context.stage_path("logs") / f"{script.stem}_{cohort_name}.log"
+    log_path.write_text(
+        completed.stdout + "\n--- STDERR ---\n" + completed.stderr,
+        encoding="utf-8",
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"R stage failed for {script.name} ({cohort_name}). See {log_path}"
+        )
+
+
 def run_r_reporting_stage(context: RunContext) -> None:
-    scripts = [
-        repo_root() / "scripts_r" / "run_boundary_models.Rmd",
-        repo_root() / "scripts_r" / "run_boundary_figures.Rmd",
-    ]
-    for script in scripts:
-        output_dir = (
-            context.stage_path("stats_r")
-            if "models" in script.stem
-            else context.stage_path("figures")
+    model_script = repo_root() / "scripts_r" / "run_boundary_models.Rmd"
+    figure_script = repo_root() / "scripts_r" / "run_boundary_figures.Rmd"
+    cohort_outputs: dict[str, dict[str, str]] = {}
+    audit_outputs = run_dynamic_audit_stage(context)
+    robustness_outputs = run_coupling_robustness_stage(context)
+    coupling_robustness_dir = context.stage_path("coupling_robustness")
+    for cohort in REPORTING_COHORTS:
+        stats_dir = context.stage_path("stats_r") / cohort.name
+        figures_dir = context.stage_path("figures") / cohort.name
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        _render_rmarkdown_report(
+            context=context,
+            script=model_script,
+            output_dir=stats_dir,
+            output_file="run_boundary_models.html",
+            cohort_name=cohort.name,
+            analysis_role=cohort.analysis_role,
+            coupling_robustness_dir=coupling_robustness_dir,
         )
-        output_file = f"{script.stem.removesuffix('.Rmd')}.html"
-        render_expression = (
-            "rmarkdown::render("
-            f"input='{script.as_posix()}', "
-            f"output_file='{output_file}', "
-            f"output_dir='{output_dir.as_posix()}', "
-            f"params=list(run_dir='{context.run_root.as_posix()}', "
-            f"script_dir='{script.parent.as_posix()}'), "
-            "envir=new.env(parent=globalenv()))"
+        cohort_outputs.setdefault(cohort.name, {})["stats_dir"] = str(stats_dir)
+
+    for cohort in REPORTING_COHORTS:
+        figures_dir = context.stage_path("figures") / cohort.name
+        _render_rmarkdown_report(
+            context=context,
+            script=figure_script,
+            output_dir=figures_dir,
+            output_file="run_boundary_figures.html",
+            cohort_name=cohort.name,
+            analysis_role=cohort.analysis_role,
+            coupling_robustness_dir=coupling_robustness_dir,
         )
-        completed = subprocess.run(
-            ["Rscript", "-e", render_expression],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        log_path = context.stage_path("logs") / f"{script.stem}.log"
-        log_path.write_text(
-            completed.stdout + "\n--- STDERR ---\n" + completed.stderr,
-            encoding="utf-8",
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"R stage failed for {script.name}. See {log_path}"
-            )
+        cohort_outputs.setdefault(cohort.name, {})["figures_dir"] = str(figures_dir)
+
     context.write_stage_metadata(
         "stats_r",
-        {"scripts": [str(script) for script in scripts], "status": "completed"},
+        {
+            "scripts": [str(model_script)],
+            "status": "completed",
+            "cohorts": [
+                {
+                    "cohort": cohort.name,
+                    "analysis_role": cohort.analysis_role,
+                    "output_dir": cohort_outputs.get(cohort.name, {}).get("stats_dir"),
+                }
+                for cohort in REPORTING_COHORTS
+            ],
+            "coupling_robustness_dir": str(coupling_robustness_dir),
+            "coupling_robustness_outputs": {name: str(path) for name, path in robustness_outputs.items()},
+        },
     )
     context.write_stage_metadata(
         "figures",
-        {"scripts": [str(script) for script in scripts], "status": "completed"},
+        {
+            "scripts": [str(figure_script)],
+            "status": "completed",
+            "cohorts": [
+                {
+                    "cohort": cohort.name,
+                    "analysis_role": cohort.analysis_role,
+                    "output_dir": cohort_outputs.get(cohort.name, {}).get("figures_dir"),
+                }
+                for cohort in REPORTING_COHORTS
+            ],
+            "dynamic_audit_dir": str(context.stage_path("dynamic_audit")),
+            "dynamic_audit_outputs": {name: str(path) for name, path in audit_outputs.items()},
+            "coupling_robustness_dir": str(coupling_robustness_dir),
+            "coupling_robustness_outputs": {name: str(path) for name, path in robustness_outputs.items()},
+        },
+    )
+    context.write_run_metadata(
+        {
+            "reporting_cohorts": [
+                {"cohort": cohort.name, "analysis_role": cohort.analysis_role}
+                for cohort in REPORTING_COHORTS
+            ]
+        },
     )
 
 

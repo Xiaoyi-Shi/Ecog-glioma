@@ -98,12 +98,19 @@ class RunContext:
         append_jsonl(self.stage_path("logs") / "run_log.jsonl", payload)
 
     def write_run_metadata(self, extra: dict[str, Any] | None = None) -> None:
-        payload = {
+        existing: dict[str, Any] = {}
+        metadata_path = self.stage_path("logs") / "run_metadata.json"
+        if metadata_path.exists():
+            import json
+
+            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+        payload = existing.copy()
+        payload.update({
             "timestamp": self.timestamp,
             "run_root": str(self.run_root),
             "created_at": self.created_at,
             "stage_dirs": {name: str(path) for name, path in self.stage_dirs.items()},
-        }
+        })
         if extra:
             payload.update(extra)
-        write_json(self.stage_path("logs") / "run_metadata.json", payload)
+        write_json(metadata_path, payload)

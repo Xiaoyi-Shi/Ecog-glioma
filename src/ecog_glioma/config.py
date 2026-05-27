@@ -26,6 +26,8 @@ STAGE_DIRS = {
     "model_tables": "06_model_tables",
     "stats_r": "07_stats_r",
     "figures": "08_figures",
+    "dynamic_audit": "09_dynamic_audit",
+    "coupling_robustness": "10_coupling_robustness",
     "logs": "logs",
 }
 

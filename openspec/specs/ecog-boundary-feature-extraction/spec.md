@@ -1,4 +1,9 @@
-## ADDED Requirements
+# ecog-boundary-feature-extraction Specification
+
+## Purpose
+Define the read-only BIDS feature-extraction workflow that produces run-scoped network, HFO, controllability, fragility, and model-ready table outputs before any audit, robustness, or reporting layers consume them.
+
+## Requirements
 
 ### Requirement: Read BIDS inputs without modifying the dataset
 The system SHALL treat `datas/data_02_BIDS` as read-only input and write all derived research outputs under a run-scoped directory in `results/<timestamp>/`.

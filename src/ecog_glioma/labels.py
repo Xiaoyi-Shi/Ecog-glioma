@@ -31,11 +31,9 @@ def interval_columns(columns: list[str]) -> list[str]:
 
 
 def distance_to_region(distance_mm: float) -> int:
-    if distance_mm <= 1.0:
+    if distance_mm < 1.5:
         return 2
-    if distance_mm <= 3.0:
-        return 3
-    return 4
+    return 3
 
 
 def parse_interval_label(raw_value: Any) -> dict[str, Any]:

@@ -1,7 +1,8 @@
 # fif-to-bids-export Specification
 
 ## Purpose
-TBD - created by archiving change export-clean-fif-to-bids. Update Purpose after archive.
+Define how cleaned preprocessed FIF recordings are exported into a read-only BIDS derivative dataset with preserved metadata, annotations, and validation reporting.
+
 ## Requirements
 ### Requirement: Export cleaned FIF recordings into a BIDS derivative dataset
 The system SHALL provide a script that converts cleaned `.fif` electrophysiology recordings into a BIDS derivative dataset rooted at a user-specified output directory.
@@ -71,4 +72,3 @@ The system SHALL provide machine-readable reporting for conversion outcomes and 
 - **WHEN** validation is requested but the configured validator command is unavailable
 - **THEN** the script reports that validation could not be run
 - **AND** it does not silently mark the dataset as validated
-

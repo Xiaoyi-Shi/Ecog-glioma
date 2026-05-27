@@ -8,6 +8,11 @@ output:
 params:
   run_dir: ""
   script_dir: ""
+  report_dir: ""
+  dynamic_audit_dir: ""
+  coupling_robustness_dir: ""
+  cohort_name: "main"
+  analysis_role: "primary"
 ---
 
 ```{r setup, include=FALSE}
@@ -26,25 +31,83 @@ suppressPackageStartupMessages({
 })
 
 run_dir <- normalizePath(params$run_dir, winslash = "/", mustWork = TRUE)
-model_dir <- file.path(run_dir, "07_stats_r")
-dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+cohort_name <- params$cohort_name
+analysis_role <- params$analysis_role
+cohort_title <- stringr::str_to_title(stringr::str_replace_all(cohort_name, "_", " "))
+report_dir <- params$report_dir
+if (!nzchar(report_dir)) {
+  report_dir <- file.path(run_dir, "07_stats_r", cohort_name)
+}
+dir.create(report_dir, recursive = TRUE, showWarnings = FALSE)
+coupling_robustness_dir <- params$coupling_robustness_dir
+if (!nzchar(coupling_robustness_dir)) {
+  coupling_robustness_dir <- file.path(run_dir, "10_coupling_robustness")
+}
+
+mixed_model_control <- lmerControl(
+  optimizer = "bobyqa",
+  optCtrl = list(maxfun = 200000),
+  calc.derivs = FALSE
+)
 
 joint_path <- file.path(run_dir, "06_model_tables", "model_joint_long.csv")
+band_metric_path <- file.path(run_dir, "06_model_tables", "model_band_metric_long.csv")
 if (!file.exists(joint_path)) {
   stop("Missing model table: ", joint_path)
 }
 
-joint <- readr::read_csv(joint_path, show_col_types = FALSE)
-if (nrow(joint) == 0) {
-  readr::write_csv(tibble::tibble(message = "No model data available"), file.path(model_dir, "stats_summary.csv"))
+read_optional_csv <- function(directory, filename) {
+  path <- file.path(directory, filename)
+  if (!file.exists(path)) {
+    return(tibble::tibble())
+  }
+  readr::read_csv(path, show_col_types = FALSE)
 }
 
-joint <- joint %>%
+filter_for_cohort <- function(data, cohort_name) {
+  if (nrow(data) == 0) {
+    return(data)
+  }
+  if (cohort_name == "main") {
+    return(data %>% filter(patient_main_included %in% TRUE))
+  }
+  if (cohort_name == "sensitivity") {
+    return(data %>% filter(patient_sensitivity_included %in% TRUE))
+  }
+  data
+}
+
+joint_all <- readr::read_csv(joint_path, show_col_types = FALSE)
+band_metric_all <- if (file.exists(band_metric_path)) {
+  readr::read_csv(band_metric_path, show_col_types = FALSE)
+} else {
+  tibble::tibble()
+}
+
+region_levels <- sort(unique(stats::na.omit(joint_all$region)))
+joint <- filter_for_cohort(joint_all, cohort_name) %>%
   mutate(
-    region = factor(region, levels = c(1, 2, 3, 4)),
+    region = factor(region, levels = region_levels),
     patient = factor(patient),
     interval_id = factor(interval_id)
   )
+
+preferred_band_levels <- c("delta", "theta", "alpha", "beta", "low_gamma", "high_gamma")
+band_metric <- filter_for_cohort(band_metric_all, cohort_name)
+if (nrow(band_metric) > 0) {
+  present_band_levels <- unique(stats::na.omit(band_metric$band))
+  band_levels <- c(
+    preferred_band_levels[preferred_band_levels %in% present_band_levels],
+    setdiff(sort(present_band_levels), preferred_band_levels)
+  )
+  band_metric <- band_metric %>%
+    mutate(
+      region = factor(region, levels = region_levels),
+      patient = factor(patient),
+      interval_id = factor(interval_id),
+      band = factor(band, levels = band_levels)
+    )
+}
 
 feature_candidates <- joint %>%
   count(feature_name, sort = TRUE) %>%
@@ -52,14 +115,56 @@ feature_candidates <- joint %>%
   slice_head(n = 12) %>%
   pull(feature_name)
 
+metric_family_candidates <- if (nrow(band_metric) == 0) {
+  character()
+} else {
+  band_metric %>%
+    filter(!is.na(feature_z), !is.na(region), !is.na(band)) %>%
+    group_by(metric_family) %>%
+    summarise(
+      n = n(),
+      n_bands = n_distinct(band),
+      n_regions = n_distinct(region),
+      .groups = "drop"
+    ) %>%
+    filter(n >= 24, n_bands >= 2, n_regions >= 2) %>%
+    arrange(desc(n), metric_family) %>%
+    pull(metric_family)
+}
+
 fit_region_model <- function(data) {
   if (n_distinct(data$region, na.rm = TRUE) < 2) {
     return(NULL)
   }
-  tryCatch(
-    lmer(feature_z ~ region + is_boundary_interface + (1 | patient/interval_id), data = data),
+  model <- tryCatch(
+    lmer(
+      feature_z ~ region + is_boundary_interface + (1 | patient),
+      data = data,
+      control = mixed_model_control
+    ),
     error = function(e) NULL
   )
+  if (!is.null(model)) {
+    return(list(model = model, model_type = "patient_random_intercept"))
+  }
+  aggregated <- data %>%
+    group_by(patient, region) %>%
+    summarise(
+      feature_z = mean(feature_z, na.rm = TRUE),
+      is_boundary_interface = max(is_boundary_interface, na.rm = TRUE),
+      .groups = "drop"
+    )
+  if (nrow(aggregated) < 6 || n_distinct(aggregated$region, na.rm = TRUE) < 2 || n_distinct(aggregated$patient) < 2) {
+    return(NULL)
+  }
+  fallback_model <- tryCatch(
+    lm(feature_z ~ region + is_boundary_interface + patient, data = aggregated),
+    error = function(e) NULL
+  )
+  if (is.null(fallback_model)) {
+    return(NULL)
+  }
+  list(model = fallback_model, model_type = "patient_aggregated_fixed_effect")
 }
 
 fit_distance_model <- function(data) {
@@ -70,9 +175,66 @@ fit_distance_model <- function(data) {
     return(NULL)
   }
   tryCatch(
-    lmer(feature_z ~ splines::ns(distance_mm, df = 3) + (1 + distance_mm | patient), data = data),
+    lmer(
+      feature_z ~ splines::ns(distance_mm, df = 3) + (1 + distance_mm | patient),
+      data = data,
+      control = mixed_model_control
+    ),
     error = function(e) NULL
   )
+}
+
+fit_distance_linear_model <- function(data) {
+  numeric_distance <- suppressWarnings(as.numeric(data$distance_mm))
+  data$distance_mm <- numeric_distance
+  data <- data[!is.na(data$distance_mm), , drop = FALSE]
+  if (nrow(data) < 8 || dplyr::n_distinct(data$patient) < 2) {
+    return(NULL)
+  }
+  tryCatch(
+    lmer(
+      feature_z ~ distance_mm + (1 + distance_mm | patient),
+      data = data,
+      control = mixed_model_control
+    ),
+    error = function(e) NULL
+  )
+}
+
+fit_region_band_model <- function(data) {
+  data <- data %>% filter(!is.na(band), nzchar(as.character(band)))
+  if (n_distinct(data$region, na.rm = TRUE) < 2 || n_distinct(data$band, na.rm = TRUE) < 2) {
+    return(NULL)
+  }
+  model <- tryCatch(
+    lmer(
+      feature_z ~ region * band + is_boundary_interface + (1 | patient),
+      data = data,
+      control = mixed_model_control
+    ),
+    error = function(e) NULL
+  )
+  if (!is.null(model)) {
+    return(list(model = model, model_type = "patient_random_intercept"))
+  }
+  aggregated <- data %>%
+    group_by(patient, region, band) %>%
+    summarise(
+      feature_z = mean(feature_z, na.rm = TRUE),
+      is_boundary_interface = max(is_boundary_interface, na.rm = TRUE),
+      .groups = "drop"
+    )
+  if (nrow(aggregated) < 8 || n_distinct(aggregated$region, na.rm = TRUE) < 2 || n_distinct(aggregated$band, na.rm = TRUE) < 2 || n_distinct(aggregated$patient) < 2) {
+    return(NULL)
+  }
+  fallback_model <- tryCatch(
+    lm(feature_z ~ region * band + is_boundary_interface + patient, data = aggregated),
+    error = function(e) NULL
+  )
+  if (is.null(fallback_model)) {
+    return(NULL)
+  }
+  list(model = fallback_model, model_type = "patient_aggregated_fixed_effect")
 }
 
 compute_interval_morans_i <- function(data) {
@@ -126,56 +288,299 @@ compute_interval_morans_i <- function(data) {
   )
 }
 
+role_label <- function(feature_name) {
+  dplyr::case_when(
+    feature_name == "mec_omega_0.5" ~ "mec",
+    feature_name == "mpc_omega_0.5" ~ "mpc",
+    stringr::str_detect(feature_name, "average_controllability_mean$") ~ "average_controllability",
+    stringr::str_detect(feature_name, "modal_controllability_mean$") ~ "modal_controllability",
+    stringr::str_detect(feature_name, "fragility_mean$") ~ "neural_fragility",
+    stringr::str_detect(feature_name, "rate_per_min$") ~ "hfo_rate",
+    stringr::str_detect(feature_name, "source_sink_index$") ~ "source_sink_index",
+    TRUE ~ NA_character_
+  )
+}
+
+safe_spearman <- function(data, x_col, y_col) {
+  data <- data %>% filter(!is.na(.data[[x_col]]), !is.na(.data[[y_col]]))
+  if (nrow(data) < 4 || n_distinct(data[[x_col]]) < 2 || n_distinct(data[[y_col]]) < 2) {
+    return(tibble::tibble(rho = NA_real_, p.value = NA_real_, n = nrow(data)))
+  }
+  test <- suppressWarnings(cor.test(data[[x_col]], data[[y_col]], method = "spearman", exact = FALSE))
+  tibble::tibble(rho = unname(test$estimate), p.value = test$p.value, n = nrow(data))
+}
+
 region_results <- purrr::map_dfr(feature_candidates, function(feature_name) {
   data <- joint %>% filter(feature_name == !!feature_name, !is.na(feature_z))
-  model <- fit_region_model(data)
-  if (is.null(model)) {
-    return(tibble::tibble(feature_name = feature_name, term = NA_character_, estimate = NA_real_, std.error = NA_real_, statistic = NA_real_, p.value = NA_real_))
+  fitted <- fit_region_model(data)
+  if (is.null(fitted)) {
+    return(tibble::tibble(
+      cohort = cohort_name,
+      analysis_role = analysis_role,
+      feature_name = feature_name,
+      term = NA_character_,
+      estimate = NA_real_,
+      std.error = NA_real_,
+      statistic = NA_real_,
+      p.value = NA_real_,
+      model_type = NA_character_,
+      n_rows = nrow(data),
+      n_patients = dplyr::n_distinct(data$patient)
+    ))
   }
-  broom.mixed::tidy(model, effects = "fixed") %>% mutate(feature_name = feature_name)
+  broom.mixed::tidy(fitted$model, effects = "fixed") %>%
+    mutate(
+      cohort = cohort_name,
+      analysis_role = analysis_role,
+      feature_name = feature_name,
+      model_type = fitted$model_type,
+      n_rows = nrow(data),
+      n_patients = dplyr::n_distinct(data$patient)
+    )
 })
 
 distance_results <- purrr::map_dfr(feature_candidates, function(feature_name) {
   data <- joint %>% filter(feature_name == !!feature_name, !is.na(feature_z))
   model <- fit_distance_model(data)
   if (is.null(model)) {
-    return(tibble::tibble(feature_name = feature_name, term = NA_character_, estimate = NA_real_, std.error = NA_real_, statistic = NA_real_, p.value = NA_real_))
+    return(tibble::tibble(
+      cohort = cohort_name,
+      analysis_role = analysis_role,
+      feature_name = feature_name,
+      term = NA_character_,
+      estimate = NA_real_,
+      std.error = NA_real_,
+      statistic = NA_real_,
+      p.value = NA_real_,
+      n_rows = nrow(data),
+      n_patients = dplyr::n_distinct(data$patient)
+    ))
   }
-  broom.mixed::tidy(model, effects = "fixed") %>% mutate(feature_name = feature_name)
+  broom.mixed::tidy(model, effects = "fixed") %>%
+    mutate(
+      cohort = cohort_name,
+      analysis_role = analysis_role,
+      feature_name = feature_name,
+      n_rows = nrow(data),
+      n_patients = dplyr::n_distinct(data$patient)
+    )
+})
+
+distance_linear_results <- purrr::map_dfr(feature_candidates, function(feature_name) {
+  data <- joint %>% filter(feature_name == !!feature_name, !is.na(feature_z))
+  model <- fit_distance_linear_model(data)
+  if (is.null(model)) {
+    return(tibble::tibble(
+      cohort = cohort_name,
+      analysis_role = analysis_role,
+      feature_name = feature_name,
+      term = NA_character_,
+      estimate = NA_real_,
+      std.error = NA_real_,
+      statistic = NA_real_,
+      p.value = NA_real_,
+      n_rows = nrow(data),
+      n_patients = dplyr::n_distinct(data$patient)
+    ))
+  }
+  broom.mixed::tidy(model, effects = "fixed") %>%
+    mutate(
+      cohort = cohort_name,
+      analysis_role = analysis_role,
+      feature_name = feature_name,
+      n_rows = nrow(data),
+      n_patients = dplyr::n_distinct(data$patient)
+    )
+})
+
+region_band_results <- purrr::map_dfr(metric_family_candidates, function(metric_family) {
+  data <- band_metric %>% filter(metric_family == !!metric_family, !is.na(feature_z))
+  feature_domain <- data %>%
+    pull(feature_family) %>%
+    stats::na.omit() %>%
+    unique()
+  feature_domain <- if (length(feature_domain) > 0) feature_domain[[1]] else NA_character_
+  fitted <- fit_region_band_model(data)
+  if (is.null(fitted)) {
+    return(
+      tibble::tibble(
+        cohort = cohort_name,
+        analysis_role = analysis_role,
+        metric_family = metric_family,
+        feature_family = feature_domain,
+        term = NA_character_,
+        estimate = NA_real_,
+        std.error = NA_real_,
+        statistic = NA_real_,
+        p.value = NA_real_,
+        model_type = NA_character_,
+        n_rows = nrow(data),
+        n_patients = dplyr::n_distinct(data$patient),
+        n_bands = dplyr::n_distinct(data$band)
+      )
+    )
+  }
+  broom.mixed::tidy(fitted$model, effects = "fixed") %>%
+    mutate(
+      cohort = cohort_name,
+      analysis_role = analysis_role,
+      metric_family = metric_family,
+      feature_family = feature_domain,
+      model_type = fitted$model_type,
+      n_rows = nrow(data),
+      n_patients = dplyr::n_distinct(data$patient),
+      n_bands = dplyr::n_distinct(data$band)
+    )
 })
 
 if ("p.value" %in% names(region_results)) {
   region_results <- region_results %>%
-    mutate(p_fdr = p.adjust(p.value, method = "BH"))
+    mutate(
+      p_fdr = p.adjust(p.value, method = "BH"),
+      p_bonferroni = p.adjust(p.value, method = "bonferroni")
+    )
 }
 if ("p.value" %in% names(distance_results)) {
   distance_results <- distance_results %>%
-    mutate(p_fdr = p.adjust(p.value, method = "BH"))
+    mutate(
+      p_fdr = p.adjust(p.value, method = "BH"),
+      p_bonferroni = p.adjust(p.value, method = "bonferroni")
+    )
+}
+if ("p.value" %in% names(distance_linear_results)) {
+  distance_linear_results <- distance_linear_results %>%
+    mutate(
+      p_fdr = p.adjust(p.value, method = "BH"),
+      p_bonferroni = p.adjust(p.value, method = "bonferroni")
+    )
+}
+if ("p.value" %in% names(region_band_results)) {
+  region_band_results <- region_band_results %>%
+    mutate(
+      p_fdr = p.adjust(p.value, method = "BH"),
+      p_bonferroni = p.adjust(p.value, method = "bonferroni")
+    )
 }
 
 moran_results <- joint %>%
   filter(feature_name %in% feature_candidates, !is.na(feature_z)) %>%
   group_by(feature_name, patient) %>%
   group_modify(~ compute_interval_morans_i(.x)) %>%
-  ungroup()
+  ungroup() %>%
+  mutate(cohort = cohort_name, analysis_role = analysis_role)
 
-summary_table <- tibble::tibble(
-  run_dir = run_dir,
-  n_features_modeled = length(feature_candidates),
-  n_rows = nrow(joint),
-  n_patients = n_distinct(joint$patient)
+role_wide <- joint %>%
+  mutate(feature_role = role_label(feature_name)) %>%
+  filter(!is.na(feature_role), !is.na(feature_z)) %>%
+  group_by(patient, session, run, interval_id, interval_index, region, distance_mm, is_boundary_interface, feature_role) %>%
+  summarise(feature_z = mean(feature_z, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = feature_role, values_from = feature_z, values_fn = mean)
+
+hfo_consistency_results <- purrr::map_dfr(
+  c("mec", "average_controllability", "neural_fragility", "source_sink_index"),
+  function(network_feature) {
+    if (!all(c("hfo_rate", network_feature) %in% names(role_wide))) {
+      return(tibble::tibble(
+        cohort = cohort_name,
+        analysis_role = analysis_role,
+        network_feature = network_feature,
+        patient = NA,
+        rho = NA_real_,
+        p.value = NA_real_,
+        n = 0
+      ))
+    }
+    role_wide %>%
+      group_by(patient) %>%
+      group_modify(~ safe_spearman(.x, "hfo_rate", network_feature)) %>%
+      ungroup() %>%
+      mutate(cohort = cohort_name, analysis_role = analysis_role, network_feature = network_feature)
+  }
 )
 
-readr::write_csv(region_results, file.path(model_dir, "region_model_results.csv"))
-readr::write_csv(distance_results, file.path(model_dir, "distance_spline_results.csv"))
-readr::write_csv(moran_results, file.path(model_dir, "morans_i_results.csv"))
-readr::write_csv(summary_table, file.path(model_dir, "stats_summary.csv"))
+robustness_summary <- read_optional_csv(coupling_robustness_dir, "robustness_summary.csv")
+if (nrow(robustness_summary) > 0) {
+  robustness_summary <- robustness_summary %>%
+    filter(cohort == cohort_name)
+}
+stability_matrix <- read_optional_csv(coupling_robustness_dir, "stability_matrix.csv")
+if (nrow(stability_matrix) > 0) {
+  stability_matrix <- stability_matrix %>%
+    filter(cohort == cohort_name)
+}
+robustness_status <- if (nrow(robustness_summary) > 0) "available" else "unavailable"
+
+cohort_summary <- tibble::tibble(
+  run_dir = run_dir,
+  cohort = cohort_name,
+  cohort_title = cohort_title,
+  analysis_role = analysis_role,
+  n_rows = nrow(joint),
+  n_band_metric_rows = nrow(band_metric),
+  n_patients = dplyr::n_distinct(joint$patient),
+  n_intervals = if (nrow(joint) == 0) 0L else joint %>% distinct(patient, interval_id) %>% nrow(),
+  n_features_modeled = length(feature_candidates),
+  n_band_metric_families_modeled = length(metric_family_candidates),
+  robustness_status = robustness_status
+)
+
+workflow_status <- tibble::tibble(
+  cohort = cohort_name,
+  analysis_role = analysis_role,
+  workflow = c(
+    "region_model",
+    "distance_spline",
+    "distance_linear",
+    "region_band_interaction",
+    "morans_i",
+    "hfo_network_consistency",
+    "coupling_robustness"
+  ),
+  status = c(
+    if (nrow(region_results) > 0 && any(!is.na(region_results$term))) "completed" else "insufficient_data",
+    if (nrow(distance_results) > 0 && any(!is.na(distance_results$term))) "completed" else "insufficient_data",
+    if (nrow(distance_linear_results) > 0 && any(!is.na(distance_linear_results$term))) "completed" else "insufficient_data",
+    if (nrow(region_band_results) > 0 && any(!is.na(region_band_results$term))) "completed" else "insufficient_data",
+    if (nrow(moran_results) > 0 && any(!is.na(moran_results$morans_i))) "completed" else "insufficient_data",
+    if (nrow(hfo_consistency_results) > 0 && any(!is.na(hfo_consistency_results$rho))) "completed" else "insufficient_data",
+    robustness_status
+  ),
+  n_rows = c(
+    nrow(region_results),
+    nrow(distance_results),
+    nrow(distance_linear_results),
+    nrow(region_band_results),
+    nrow(moran_results),
+    nrow(hfo_consistency_results),
+    nrow(robustness_summary)
+  ),
+  n_patients = cohort_summary$n_patients[[1]]
+)
+
+readr::write_csv(region_results, file.path(report_dir, "region_model_results.csv"))
+readr::write_csv(distance_results, file.path(report_dir, "distance_spline_results.csv"))
+readr::write_csv(distance_linear_results, file.path(report_dir, "distance_linear_results.csv"))
+readr::write_csv(region_band_results, file.path(report_dir, "region_band_interaction_results.csv"))
+readr::write_csv(moran_results, file.path(report_dir, "morans_i_results.csv"))
+readr::write_csv(role_wide %>% mutate(cohort = cohort_name, analysis_role = analysis_role), file.path(report_dir, "joint_feature_role_wide.csv"))
+readr::write_csv(hfo_consistency_results, file.path(report_dir, "hfo_network_consistency_results.csv"))
+readr::write_csv(robustness_summary, file.path(report_dir, "coupling_robustness_summary.csv"))
+readr::write_csv(stability_matrix, file.path(report_dir, "coupling_stability_matrix.csv"))
+readr::write_csv(cohort_summary, file.path(report_dir, "cohort_summary.csv"))
+readr::write_csv(workflow_status, file.path(report_dir, "workflow_status.csv"))
+readr::write_csv(cohort_summary, file.path(report_dir, "stats_summary.csv"))
 ```
 
 ## Run Summary
 
 ```{r}
-knitr::kable(summary_table)
+knitr::kable(cohort_summary)
+```
+
+## Workflow Status
+
+```{r}
+knitr::kable(workflow_status)
 ```
 
 ## Region Model Results
@@ -190,8 +595,40 @@ knitr::kable(head(region_results, 30))
 knitr::kable(head(distance_results, 30))
 ```
 
+## Region By Band Interaction
+
+```{r}
+knitr::kable(head(region_band_results, 30))
+```
+
 ## Moran's I Diagnostics
 
 ```{r}
 knitr::kable(head(moran_results, 30))
+```
+
+## HFO Network Consistency
+
+```{r}
+knitr::kable(head(hfo_consistency_results, 30))
+```
+
+## Coupling Robustness
+
+```{r}
+if (nrow(robustness_summary) == 0) {
+  knitr::kable(tibble::tibble(note = "Robustness classification unavailable for this run."))
+} else {
+  knitr::kable(robustness_summary)
+}
+```
+
+## Stability Matrix
+
+```{r}
+if (nrow(stability_matrix) == 0) {
+  knitr::kable(tibble::tibble(note = "Stability matrix unavailable for this run."))
+} else {
+  knitr::kable(stability_matrix)
+}
 ```

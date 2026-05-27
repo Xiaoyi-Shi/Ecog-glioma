@@ -7,6 +7,11 @@ output:
 params:
   run_dir: ""
   script_dir: ""
+  report_dir: ""
+  dynamic_audit_dir: ""
+  coupling_robustness_dir: ""
+  cohort_name: "main"
+  analysis_role: "primary"
 ---
 
 ```{r setup, include=FALSE}
@@ -17,11 +22,18 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(tidyr)
   library(stringr)
+  library(forcats)
   library(knitr)
 })
 
 run_dir <- normalizePath(params$run_dir, winslash = "/", mustWork = TRUE)
-fig_dir <- file.path(run_dir, "08_figures")
+cohort_name <- params$cohort_name
+analysis_role <- params$analysis_role
+cohort_title <- stringr::str_to_title(stringr::str_replace_all(cohort_name, "_", " "))
+fig_dir <- params$report_dir
+if (!nzchar(fig_dir)) {
+  fig_dir <- file.path(run_dir, "08_figures", cohort_name)
+}
 dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 
 script_dir <- params$script_dir
@@ -31,14 +43,102 @@ if (!nzchar(script_dir)) {
 script_dir <- normalizePath(script_dir, winslash = "/", mustWork = TRUE)
 source(file.path(script_dir, "theme_khaki.R"))
 
+read_optional_csv <- function(directory, filename) {
+  path <- file.path(directory, filename)
+  if (!file.exists(path)) {
+    return(tibble::tibble())
+  }
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+filter_for_cohort <- function(data, cohort_name) {
+  if (nrow(data) == 0) {
+    return(data)
+  }
+  if (cohort_name == "main") {
+    return(data %>% filter(patient_main_included %in% TRUE))
+  }
+  if (cohort_name == "sensitivity") {
+    return(data %>% filter(patient_sensitivity_included %in% TRUE))
+  }
+  data
+}
+
 joint_path <- file.path(run_dir, "06_model_tables", "model_joint_long.csv")
+band_metric_path <- file.path(run_dir, "06_model_tables", "model_band_metric_long.csv")
 if (!file.exists(joint_path)) {
   stop("Missing model table: ", joint_path)
 }
+if (!file.exists(band_metric_path)) {
+  stop("Missing model table: ", band_metric_path)
+}
 
-joint <- readr::read_csv(joint_path, show_col_types = FALSE)
-joint <- joint %>%
-  mutate(region = factor(region, levels = c(1, 2, 3, 4)))
+joint_all <- readr::read_csv(joint_path, show_col_types = FALSE)
+band_metric_all <- readr::read_csv(band_metric_path, show_col_types = FALSE)
+region_levels <- sort(unique(stats::na.omit(joint_all$region)))
+region_palette <- c("1" = "#6E7F4D", "2" = "#A65E2E", "3" = "#7B3F3F", "4" = "#8B6F47")
+
+joint <- filter_for_cohort(joint_all, cohort_name) %>%
+  mutate(region = factor(region, levels = region_levels))
+band_metric <- filter_for_cohort(band_metric_all, cohort_name) %>%
+  mutate(region = factor(region, levels = region_levels))
+
+stats_dir <- file.path(run_dir, "07_stats_r", cohort_name)
+dynamic_audit_dir <- params$dynamic_audit_dir
+if (!nzchar(dynamic_audit_dir)) {
+  dynamic_audit_dir <- file.path(run_dir, "09_dynamic_audit")
+}
+coupling_robustness_dir <- params$coupling_robustness_dir
+if (!nzchar(coupling_robustness_dir)) {
+  coupling_robustness_dir <- file.path(run_dir, "10_coupling_robustness")
+}
+
+band_aggregated_pairs <- read_optional_csv(dynamic_audit_dir, "band_aggregated_pairs.csv")
+if (nrow(band_aggregated_pairs) > 0) {
+  band_aggregated_pairs <- band_aggregated_pairs %>%
+    filter(cohort == cohort_name) %>%
+    mutate(region = factor(region, levels = region_levels))
+}
+cohort_manifest <- read_optional_csv(dynamic_audit_dir, "cohort_manifest.csv")
+hfo_consistency_results <- read_optional_csv(stats_dir, "hfo_network_consistency_results.csv")
+robustness_summary_all <- read_optional_csv(coupling_robustness_dir, "robustness_summary.csv")
+stability_matrix_all <- read_optional_csv(coupling_robustness_dir, "stability_matrix.csv")
+inclusion_threshold_scan <- read_optional_csv(coupling_robustness_dir, "inclusion_threshold_scan.csv")
+distance_threshold_scan <- read_optional_csv(coupling_robustness_dir, "distance_threshold_scan.csv")
+
+robustness_summary <- robustness_summary_all %>%
+  filter(cohort == cohort_name)
+stability_matrix <- stability_matrix_all %>%
+  filter(cohort == cohort_name)
+
+cohort_suffix <- if (analysis_role == "primary") {
+  paste0(cohort_title, " Cohort")
+} else {
+  paste0(cohort_title, " Cohort (Exploratory)")
+}
+
+robustness_palette <- c(
+  supported = khaki_palette$accent,
+  exploratory = khaki_palette$accent2,
+  threshold_sensitive = "#7B3F3F",
+  artifact_risk = "#6B5A7A",
+  insufficient = khaki_palette$border,
+  stable = khaki_palette$accent,
+  significance_loss = khaki_palette$accent2,
+  direction_reversal = "#7B3F3F",
+  not_applicable = "#CEC1A7"
+)
+
+empty_plot <- function(title, subtitle = "No analyzable rows were available for this figure.") {
+  ggplot() +
+    annotate("text", x = 0, y = 0.1, label = title, fontface = "bold", size = 5, color = khaki_palette$text) +
+    annotate("text", x = 0, y = -0.1, label = subtitle, size = 3.4, color = khaki_palette$text) +
+    xlim(-1, 1) +
+    ylim(-1, 1) +
+    labs(title = title) +
+    theme_void() +
+    theme_boundary_khaki()
+}
 
 save_plot <- function(plot_obj, filename, width = 10, height = 6) {
   ggplot2::ggsave(
@@ -51,87 +151,332 @@ save_plot <- function(plot_obj, filename, width = 10, height = 6) {
   )
 }
 
-distance_plot_data <- joint %>%
-  filter(!is.na(distance_mm), feature_family %in% c("static", "dynamic", "fragility", "hfo")) %>%
-  count(patient, interval_id, region, distance_mm)
-
-if (nrow(distance_plot_data) > 0) {
-  p_distance <- ggplot(distance_plot_data, aes(x = distance_mm, fill = region)) +
-    geom_histogram(binwidth = 0.5, color = khaki_palette$border, alpha = 0.85) +
-    scale_fill_manual(values = c("#6E7F4D", "#A65E2E", "#7B3F3F", "#8B6F47")) +
-    labs(
-      title = "Figure 2. Interval Distance Distribution",
-      x = "Distance to tumor boundary (mm)",
-      y = "Interval count",
-      fill = "Region"
+add_region_points <- function(plot_obj, data, x_col, y_col) {
+  plot_obj +
+    geom_boxplot(
+      data = data,
+      aes(x = .data[[x_col]], y = .data[[y_col]], fill = .data[[x_col]]),
+      alpha = 0.82,
+      outlier.shape = NA,
+      width = 0.65
     ) +
-    theme_boundary_khaki()
-  save_plot(p_distance, "Figure2_distance_distribution.png")
-} else {
-  p_distance <- NULL
-}
-
-top_features <- joint %>%
-  count(feature_name, sort = TRUE) %>%
-  slice_head(n = 6) %>%
-  pull(feature_name)
-
-feature_box <- joint %>%
-  filter(feature_name %in% top_features, !is.na(feature_z))
-
-if (nrow(feature_box) > 0) {
-  p_features <- ggplot(feature_box, aes(x = region, y = feature_z, fill = region)) +
-    geom_boxplot(alpha = 0.85, outlier.size = 0.6) +
-    facet_wrap(~ feature_name, scales = "free_y") +
-    scale_fill_manual(values = c("#6E7F4D", "#A65E2E", "#7B3F3F", "#8B6F47")) +
-    labs(
-      title = "Figure 3-8 Preview. Region-Level Feature Distributions",
-      x = "Region",
-      y = "Patient-normalized feature value"
+    geom_jitter(
+      data = data,
+      aes(x = .data[[x_col]], y = .data[[y_col]], color = .data[[x_col]]),
+      width = 0.18,
+      height = 0,
+      alpha = 0.5,
+      size = 1.2
     ) +
-    theme_boundary_khaki()
-  save_plot(p_features, "Figure3_8_feature_distributions.png", width = 12, height = 8)
-} else {
-  p_features <- NULL
-}
-
-hfo_scatter_data <- joint %>%
-  filter(str_detect(feature_name, "rate_per_min"), !is.na(feature_z), !is.na(distance_mm))
-
-if (nrow(hfo_scatter_data) > 0) {
-  p_hfo <- ggplot(hfo_scatter_data, aes(x = distance_mm, y = feature_z, color = region)) +
-    geom_point(alpha = 0.75, size = 1.8) +
-    geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
-    scale_color_manual(values = c("#6E7F4D", "#A65E2E", "#7B3F3F", "#8B6F47")) +
-    facet_wrap(~ feature_name, scales = "free_y") +
-    labs(
-      title = "Figure 6/10 Preview. HFO Rate vs Boundary Distance",
-      x = "Distance to tumor boundary (mm)",
-      y = "Patient-normalized HFO feature"
-    ) +
-    theme_boundary_khaki()
-  save_plot(p_hfo, "Figure6_10_hfo_distance.png", width = 12, height = 8)
-} else {
-  p_hfo <- NULL
+    scale_fill_manual(values = region_palette, drop = FALSE) +
+    scale_color_manual(values = region_palette, drop = FALSE)
 }
 ```
 
-## Generated Figures
+```{r figures}
+main_findings <- c(
+  "overall_coupling",
+  "region2_coupling",
+  "region2_ac_elevation",
+  "region2_fragility_reduction"
+)
+
+fragility_metrics <- c("fragility_high_ratio", "fragility_p75", "fragility_p90")
+fragility_labels <- c(
+  fragility_high_ratio = "Fragility High Ratio",
+  fragility_p75 = "Fragility P75",
+  fragility_p90 = "Fragility P90"
+)
+
+ac_metric <- "average_controllability_p90"
+
+if (nrow(cohort_manifest) > 0) {
+  manifest_plot_data <- cohort_manifest %>%
+    mutate(
+      cohort = factor(cohort, levels = c("main", "sensitivity", "full_modelable")),
+      cohort_label = forcats::fct_recode(
+        cohort,
+        "Main" = "main",
+        "Sensitivity" = "sensitivity",
+        "Full modelable" = "full_modelable"
+      )
+    ) %>%
+    select(cohort_label, patient_count, interval_count) %>%
+    pivot_longer(cols = c(patient_count, interval_count), names_to = "measure", values_to = "count") %>%
+    mutate(
+      measure = factor(
+        measure,
+        levels = c("patient_count", "interval_count"),
+        labels = c("Patients", "Intervals")
+      )
+    )
+
+  p_cohort <- ggplot(manifest_plot_data, aes(x = cohort_label, y = count, fill = measure)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.68, alpha = 0.9) +
+    scale_fill_manual(values = c("Patients" = khaki_palette$accent, "Intervals" = khaki_palette$accent2)) +
+    labs(
+      title = "Figure 1. Cohort Definition and Analytical Coverage",
+      subtitle = paste("Current rendered report:", cohort_suffix),
+      x = NULL,
+      y = "Count",
+      fill = NULL
+    ) +
+    theme_boundary_khaki()
+} else {
+  p_cohort <- empty_plot("Figure 1. Cohort Definition and Analytical Coverage")
+}
+save_plot(p_cohort, "Figure1_cohort_definition_and_coverage.png", width = 9, height = 6)
+
+fragility_plot_data <- band_metric %>%
+  filter(metric_family %in% fragility_metrics, !is.na(feature_z), !is.na(region)) %>%
+  mutate(
+    metric_family = factor(metric_family, levels = fragility_metrics, labels = fragility_labels[fragility_metrics])
+  )
+
+if (nrow(fragility_plot_data) > 0) {
+  p_fragility <- add_region_points(ggplot(), fragility_plot_data, "region", "feature_z") +
+    facet_wrap(~ metric_family, nrow = 1) +
+    labs(
+      title = paste("Figure 2. Fragility Metrics Show the Clearest Regional Separation:", cohort_suffix),
+      subtitle = "Main text regional effect should be anchored to fragility, not to a broad multi-metric panel.",
+      x = "Region",
+      y = "Patient-normalized feature value"
+    ) +
+    theme_boundary_khaki() +
+    theme(legend.position = "none")
+} else {
+  p_fragility <- empty_plot(paste("Figure 2. Fragility Metrics by Region:", cohort_suffix))
+}
+save_plot(p_fragility, "Figure2_fragility_region_contrasts.png", width = 12, height = 5.8)
+
+phenotype_data <- band_aggregated_pairs %>%
+  filter(!is.na(feature_z_average_controllability), !is.na(feature_z_fragility), !is.na(region))
+
+cohort_rho <- robustness_summary %>%
+  filter(finding_id == "overall_coupling") %>%
+  pull(observed_value)
+cohort_rho_label <- if (length(cohort_rho) > 0 && !is.na(cohort_rho[[1]])) {
+  paste0("Overall rho = ", sprintf("%.3f", cohort_rho[[1]]))
+} else {
+  "Overall rho unavailable"
+}
+
+if (nrow(phenotype_data) > 0) {
+  p_ac_nf <- ggplot(
+    phenotype_data,
+    aes(x = feature_z_average_controllability, y = feature_z_fragility, color = region)
+  ) +
+    geom_hline(yintercept = 0, color = khaki_palette$border, linewidth = 0.7) +
+    geom_vline(xintercept = 0, color = khaki_palette$border, linewidth = 0.7) +
+    geom_point(alpha = 0.72, size = 1.9) +
+    geom_smooth(method = "lm", se = FALSE, color = khaki_palette$text, linewidth = 0.9) +
+    annotate(
+      "label",
+      x = Inf,
+      y = Inf,
+      hjust = 1.02,
+      vjust = 1.2,
+      label = cohort_rho_label,
+      fill = khaki_palette$panel_bg,
+      color = khaki_palette$text,
+      label.size = 0.2
+    ) +
+    scale_color_manual(values = region_palette, drop = FALSE) +
+    labs(
+      title = paste("Figure 3. Average Controllability and Fragility Form a Stable Inverse Coupling:", cohort_suffix),
+      subtitle = "This is the strongest and most reproducible result in the current dataset.",
+      x = "Average controllability z-score",
+      y = "Fragility z-score",
+      color = "Region"
+    ) +
+    theme_boundary_khaki()
+} else {
+  p_ac_nf <- empty_plot(paste("Figure 3. AC-NF Phenotype Space:", cohort_suffix))
+}
+save_plot(p_ac_nf, "Figure3_ac_nf_inverse_coupling.png", width = 8.8, height = 7)
+
+robustness_heatmap_data <- robustness_summary_all %>%
+  filter(finding_id %in% main_findings) %>%
+  mutate(
+    cohort = factor(cohort, levels = c("main", "sensitivity", "full_modelable")),
+    finding_label = factor(
+      finding_label,
+      levels = c(
+        "Overall AC-NF coupling",
+        "Region 2 AC-NF coupling",
+        "Region 2 minus Region 1 average controllability",
+        "Region 2 minus Region 1 fragility"
+      )
+    ),
+    robustness_status = factor(
+      robustness_status,
+      levels = c("supported", "threshold_sensitive", "exploratory", "artifact_risk", "insufficient")
+    ),
+    tile_label = dplyr::case_when(
+      finding_kind == "coupling" ~ sprintf("rho=%.3f", observed_value),
+      TRUE ~ sprintf("effect=%.3f", observed_value)
+    )
+  )
+
+if (nrow(robustness_heatmap_data) > 0) {
+  p_robustness <- ggplot(
+    robustness_heatmap_data,
+    aes(x = cohort, y = finding_label, fill = robustness_status)
+  ) +
+    geom_tile(color = khaki_palette$plot_bg, linewidth = 0.6) +
+    geom_text(aes(label = tile_label), size = 3.1, color = khaki_palette$text) +
+    scale_fill_manual(values = robustness_palette, drop = FALSE) +
+    labs(
+      title = "Figure 4. Robustness Summary Across Cohorts",
+      subtitle = "AC-NF coupling remains supported across cohorts; region-level AC and fragility contrasts are weaker.",
+      x = NULL,
+      y = NULL,
+      fill = "Status"
+    ) +
+    theme_boundary_khaki() +
+    theme(axis.text.x = element_text(face = "bold"))
+} else {
+  p_robustness <- empty_plot("Figure 4. Robustness Summary Across Cohorts")
+}
+save_plot(p_robustness, "Figure4_cross_cohort_robustness_heatmap.png", width = 11.5, height = 6.3)
+
+threshold_scan_plot_data <- inclusion_threshold_scan %>%
+  filter(finding_id %in% main_findings) %>%
+  mutate(
+    finding_label = factor(
+      finding_label,
+      levels = c(
+        "Overall AC-NF coupling",
+        "Region 2 AC-NF coupling",
+        "Region 2 minus Region 1 average controllability",
+        "Region 2 minus Region 1 fragility"
+      )
+    )
+  )
+
+if (nrow(threshold_scan_plot_data) > 0) {
+  p_threshold <- ggplot(
+    threshold_scan_plot_data,
+    aes(x = threshold_value, y = observed_value, group = 1)
+  ) +
+    geom_hline(yintercept = 0, color = khaki_palette$border, linewidth = 0.6) +
+    geom_line(linewidth = 0.95, alpha = 0.9, color = khaki_palette$accent2) +
+    geom_point(size = 2.1, color = khaki_palette$accent2) +
+    facet_wrap(~ finding_label, scales = "free_y") +
+    labs(
+      title = "Figure 5. Inclusion-Threshold Stability Scan",
+      subtitle = "Coupling stays negative and stable; region-2 AC elevation is much less stable as thresholds change.",
+      x = "Minimum usable intervals per patient",
+      y = "Observed value"
+    ) +
+    theme_boundary_khaki()
+} else {
+  p_threshold <- empty_plot("Figure 5. Inclusion-Threshold Stability Scan")
+}
+save_plot(p_threshold, "Figure5_inclusion_threshold_stability_scan.png", width = 12, height = 8)
+
+ac_fragility_region_data <- band_metric %>%
+  filter(metric_family %in% c(ac_metric, "fragility_p90"), !is.na(feature_z), !is.na(region)) %>%
+  mutate(
+    metric_family = factor(
+      metric_family,
+      levels = c(ac_metric, "fragility_p90"),
+      labels = c("Average controllability P90", "Fragility P90")
+    )
+  )
+
+if (nrow(ac_fragility_region_data) > 0) {
+  p_region_side_by_side <- add_region_points(ggplot(), ac_fragility_region_data, "region", "feature_z") +
+    facet_wrap(~ metric_family, nrow = 1) +
+    labs(
+      title = paste("Supplementary Figure 1. Region-2 AC Elevation Is Weaker Than Fragility Reduction:", cohort_suffix),
+      x = "Region",
+      y = "Patient-normalized feature value"
+    ) +
+    theme_boundary_khaki() +
+    theme(legend.position = "none")
+} else {
+  p_region_side_by_side <- empty_plot(paste("Supplementary Figure 1. AC and Fragility Region Contrasts:", cohort_suffix))
+}
+save_plot(p_region_side_by_side, "SupplementaryFigure1_region2_ac_vs_fragility.png", width = 10.5, height = 5.6)
+
+if (nrow(hfo_consistency_results) > 0 && "rho" %in% names(hfo_consistency_results)) {
+  hfo_consistency_plot_data <- hfo_consistency_results %>%
+    filter(!is.na(rho), !is.na(network_feature)) %>%
+    mutate(network_feature = forcats::fct_infreq(network_feature))
+
+  if (nrow(hfo_consistency_plot_data) > 0) {
+    p_hfo_consistency <- ggplot(hfo_consistency_plot_data, aes(x = network_feature, y = rho, fill = network_feature)) +
+      geom_hline(yintercept = 0, color = khaki_palette$border, linewidth = 0.7) +
+      geom_boxplot(alpha = 0.82, outlier.size = 0.7) +
+      scale_fill_manual(
+        values = c(
+          average_controllability = khaki_palette$accent,
+          mec = khaki_palette$accent2,
+          neural_fragility = khaki_palette$accent3,
+          source_sink_index = khaki_palette$border
+        ),
+        drop = FALSE
+      ) +
+      labs(
+        title = paste("Supplementary Figure 2. HFO-Network Correspondence Remains Limited:", cohort_suffix),
+        subtitle = "Median patient-level correlations stay close to zero and should not drive the main narrative.",
+        x = "Network feature",
+        y = "Patient-level Spearman rho"
+      ) +
+      theme_boundary_khaki() +
+      theme(axis.text.x = element_text(angle = 22, hjust = 1), legend.position = "none")
+  } else {
+    p_hfo_consistency <- empty_plot(paste("Supplementary Figure 2. HFO-Network Correspondence:", cohort_suffix))
+  }
+} else {
+  p_hfo_consistency <- empty_plot(paste("Supplementary Figure 2. HFO-Network Correspondence:", cohort_suffix))
+}
+save_plot(p_hfo_consistency, "SupplementaryFigure2_hfo_network_consistency.png", width = 10, height = 6)
+```
+
+## Main Figures
+
+### Figure 1
+
+```{r}
+print(p_cohort)
+```
 
 ### Figure 2
 
 ```{r}
-if (!is.null(p_distance)) print(p_distance)
+print(p_fragility)
 ```
 
-### Figure 3-8 Preview
+### Figure 3
 
 ```{r}
-if (!is.null(p_features)) print(p_features)
+print(p_ac_nf)
 ```
 
-### Figure 6/10 Preview
+### Figure 4
 
 ```{r}
-if (!is.null(p_hfo)) print(p_hfo)
+print(p_robustness)
+```
+
+### Figure 5
+
+```{r}
+print(p_threshold)
+```
+
+## Supplementary Figures
+
+### Supplementary Figure 1
+
+```{r}
+print(p_region_side_by_side)
+```
+
+### Supplementary Figure 2
+
+```{r}
+print(p_hfo_consistency)
 ```
